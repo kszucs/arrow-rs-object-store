@@ -152,6 +152,10 @@ impl<T: ObjectStore> std::fmt::Display for ThrottledStore<T> {
 #[async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl<T: ObjectStore> ObjectStore for ThrottledStore<T> {
+    fn prefix(&self) -> Option<&Path> {
+        self.inner.prefix()
+    }
+
     async fn put_opts(
         &self,
         location: &Path,

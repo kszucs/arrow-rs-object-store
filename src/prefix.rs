@@ -96,6 +96,11 @@ fn strip_meta(prefix: &Path, meta: ObjectMeta) -> ObjectMeta {
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
+    fn prefix(&self) -> Option<&Path> {
+        // The constant prefix this store applies is exactly its mount point.
+        (!self.prefix.as_ref().is_empty()).then_some(&self.prefix)
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -117,7 +122,9 @@ impl<T: ObjectStore> ObjectStore for PrefixStore<T> {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let full_path = self.full_path(location);
-        self.inner.get_opts(&full_path, options).await
+        let mut result = self.inner.get_opts(&full_path, options).await?;
+        result.meta = self.strip_meta(result.meta);
+        Ok(result)
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {

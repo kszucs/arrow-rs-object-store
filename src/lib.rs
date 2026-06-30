@@ -744,6 +744,23 @@ pub type MultipartId = String;
 ///
 #[async_trait]
 pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
+    /// The path prefix this store's namespace is mounted at, if any.
+    ///
+    /// Most stores serve their whole scheme/authority and return `None` (the
+    /// default). A store rooted at a sub-path — e.g. a
+    /// [`PrefixStore`](prefix::PrefixStore), or an operator rooted at
+    /// `/user/repo` — returns that prefix.
+    ///
+    /// A registry that keys stores by scheme/authority can use this to mount a
+    /// store under a sub-path: it routes operations whose path falls under the
+    /// prefix to this store, strips the prefix before delegating, and re-adds it
+    /// to returned locations. Reporting a prefix lets such a store be addressed
+    /// by its full, authority-absolute path without the prefix being applied
+    /// twice.
+    fn prefix(&self) -> Option<&Path> {
+        None
+    }
+
     /// Save the provided `payload` to `location` with the given options
     ///
     /// The operation is guaranteed to be atomic, it will either successfully
@@ -1138,6 +1155,10 @@ macro_rules! as_ref_impl {
         #[async_trait]
         #[deny(clippy::missing_trait_methods)]
         impl<T: ObjectStore + ?Sized> ObjectStore for $type {
+            fn prefix(&self) -> Option<&Path> {
+                self.as_ref().prefix()
+            }
+
             async fn put_opts(
                 &self,
                 location: &Path,
