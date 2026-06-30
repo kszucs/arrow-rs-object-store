@@ -63,6 +63,10 @@ impl Display for ChunkedStore {
 #[async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl ObjectStore for ChunkedStore {
+    fn prefix(&self) -> Option<&Path> {
+        self.inner.prefix()
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
