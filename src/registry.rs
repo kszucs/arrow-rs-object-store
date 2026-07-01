@@ -18,7 +18,12 @@
 //! Map object URLs to [`ObjectStore`]
 
 use crate::path::{InvalidPart, Path, PathPart};
-use crate::{ObjectStore, parse_url_opts};
+use crate::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, parse_url_opts,
+};
+use async_trait::async_trait;
+use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -300,6 +305,153 @@ fn path_suffix(url: &Url, depth: usize) -> Result<Path, Error> {
     Ok(path)
 }
 
+/// Prepend `prefix` to `path`.
+fn with_prefix(prefix: &Path, path: &Path) -> Path {
+    prefix.parts().chain(path.parts()).collect()
+}
+
+/// An [`ObjectStore`] backed by an [`ObjectStoreRegistry`], serving one
+/// scheme/authority and addressed with authority-relative paths.
+///
+/// Each operation's path is resolved through the registry (as
+/// `authority`/`path`) to the responsible store and the path relative to that
+/// store's registered prefix; the prefix is stripped before delegating and
+/// re-added to returned locations. This lets a store registered under a path
+/// prefix — e.g. an operator rooted at `hf://buckets/user/repo` — be addressed
+/// by its full, authority-absolute path without the prefix being applied twice,
+/// and several such stores to coexist under one authority, all behind a single
+/// [`ObjectStore`].
+#[derive(Debug, Clone)]
+pub struct RegistryStore {
+    registry: Arc<dyn ObjectStoreRegistry>,
+    /// The scheme/authority this store serves (any path is ignored).
+    base: Url,
+}
+
+impl std::fmt::Display for RegistryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RegistryStore({})", &self.base[..url::Position::AfterPort])
+    }
+}
+
+impl RegistryStore {
+    /// Create a store that routes operations for `base`'s scheme/authority
+    /// through `registry`.
+    pub fn new(registry: Arc<dyn ObjectStoreRegistry>, base: Url) -> Self {
+        Self { registry, base }
+    }
+
+    /// Resolve an authority-relative `location` to the responsible store, the
+    /// path relative to its registered prefix, and that prefix (the part of
+    /// `location` consumed by the registration).
+    fn route(
+        &self,
+        location: &Path,
+    ) -> crate::Result<(Arc<dyn ObjectStore>, Path, Path)> {
+        let full = Url::parse(&format!(
+            "{}/{}",
+            &self.base[..url::Position::AfterPort],
+            location.as_ref()
+        ))
+        .map_err(|source| crate::Error::Generic {
+            store: "RegistryStore",
+            source: Box::new(source),
+        })?;
+        let (store, rel) = self.registry.resolve(&full)?;
+        // The registered prefix is `location` with the resolved remainder
+        // (`rel`) trimmed off the end.
+        let keep = location.parts().count().saturating_sub(rel.parts().count());
+        let prefix: Path = location.parts().take(keep).collect();
+        Ok((store, rel, prefix))
+    }
+}
+
+#[async_trait]
+impl ObjectStore for RegistryStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> crate::Result<PutResult> {
+        let (store, rel, _) = self.route(location)?;
+        store.put_opts(&rel, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> crate::Result<Box<dyn MultipartUpload>> {
+        let (store, rel, _) = self.route(location)?;
+        store.put_multipart_opts(&rel, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> crate::Result<GetResult> {
+        let (store, rel, prefix) = self.route(location)?;
+        let mut result = store.get_opts(&rel, options).await?;
+        result.meta.location = with_prefix(&prefix, &result.meta.location);
+        Ok(result)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, crate::Result<Path>>,
+    ) -> BoxStream<'static, crate::Result<Path>> {
+        let this = self.clone();
+        locations
+            .then(move |location| {
+                let this = this.clone();
+                async move {
+                    let location = location?;
+                    let (store, rel, _) = this.route(&location)?;
+                    store.delete(&rel).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, crate::Result<ObjectMeta>> {
+        let location = prefix.cloned().unwrap_or_default();
+        match self.route(&location) {
+            Ok((store, rel, registered)) => store
+                .list(Some(&rel))
+                .map_ok(move |mut meta| {
+                    meta.location = with_prefix(&registered, &meta.location);
+                    meta
+                })
+                .boxed(),
+            Err(e) => stream::once(async move { Err(e) }).boxed(),
+        }
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> crate::Result<ListResult> {
+        let location = prefix.cloned().unwrap_or_default();
+        let (store, rel, registered) = self.route(&location)?;
+        let mut result = store.list_with_delimiter(Some(&rel)).await?;
+        for meta in &mut result.objects {
+            meta.location = with_prefix(&registered, &meta.location);
+        }
+        for cp in &mut result.common_prefixes {
+            *cp = with_prefix(&registered, cp);
+        }
+        Ok(result)
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> crate::Result<()> {
+        let (store, from_rel, _) = self.route(from)?;
+        let (to_store, to_rel, _) = self.route(to)?;
+        if !Arc::ptr_eq(&store, &to_store) {
+            return Err(crate::Error::Generic {
+                store: "RegistryStore",
+                source: "copy across different registered object stores is not supported".into(),
+            });
+        }
+        store.copy_opts(&from_rel, &to_rel, options).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +605,45 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&resolved, &inner));
         assert_eq!(path.as_ref(), "x");
+    }
+
+    #[tokio::test]
+    async fn registry_store_routes_and_strips_prefix() {
+        let registry = Arc::new(DefaultObjectStoreRegistry::new());
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        // Register a store under a path prefix (a non-lazy scheme so an
+        // unregistered path errors deterministically).
+        registry.register(Url::parse("mock://bucket/a/b").unwrap(), Arc::clone(&inner));
+
+        let store = RegistryStore::new(
+            Arc::clone(&registry) as Arc<dyn ObjectStoreRegistry>,
+            Url::parse("mock://bucket").unwrap(),
+        );
+
+        // Address by the full authority-relative path.
+        store
+            .put(&Path::from("a/b/x"), PutPayload::from_static(b"data"))
+            .await
+            .unwrap();
+        // The backing store sees the prefix stripped.
+        let bytes = inner
+            .get(&Path::from("x"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"data");
+        // Listing re-adds the prefix.
+        let listed = store
+            .list(Some(&Path::from("a/b")))
+            .map_ok(|m| m.location)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(listed, vec![Path::from("a/b/x")]);
+        // get reports the authority-relative location.
+        let meta = store.get(&Path::from("a/b/x")).await.unwrap().meta;
+        assert_eq!(meta.location, Path::from("a/b/x"));
     }
 }
